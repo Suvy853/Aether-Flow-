@@ -1,0 +1,14 @@
+anthropic==0.40.0
+fastmcp==0.4.1
+langgraph==0.2.50
+langchain-anthropic==0.3.0
+fastapi==0.115.0
+uvicorn==0.32.0
+psycopg[binary]==3.2.3
+pandas==2.2.3
+plotly==5.24.1
+dash==2.18.1
+python-dotenv==1.0.1
+requests==2.32.3
+RestrictedPython==7.4
+numpy==2.1.3
