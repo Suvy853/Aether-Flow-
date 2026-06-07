@@ -429,4 +429,4 @@ def create_dash_app(server=None, url_base_pathname="/dashboard/"):
 
 if __name__ == "__main__":
     app = create_dash_app()
-    app.run(debug=False, port="8050")
+    app.run_server(debug=True, port="8050")

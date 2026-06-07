@@ -7,3 +7,4 @@ if __name__ == "__main__":
     os.environ["API_BASE"] = api_base
     app = create_dash_app()
     app.run(host="0.0.0.0", port=str(8050), debug=False)
+    

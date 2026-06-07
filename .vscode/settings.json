@@ -1,7 +1,8 @@
 {
+  "json.schemaDownload.enable": false,
   "json.schemas": [
     {
-      "fileMatch": ["railway.json", "/railway.json"],
+      "fileMatch": ["railway.json", "/railway.json", "railway-dashboard.json", "/railway-dashboard.json"],
       "url": "./.vscode/railway.schema.json",
       "name": "Railway local schema stub"
     }
