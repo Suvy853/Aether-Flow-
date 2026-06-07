@@ -1,0 +1,9 @@
+{
+  "json.schemas": [
+    {
+      "fileMatch": ["railway.json", "/railway.json"],
+      "url": "./.vscode/railway.schema.json",
+      "name": "Railway local schema stub"
+    }
+  ]
+}

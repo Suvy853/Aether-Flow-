@@ -1,0 +1,8 @@
+{
+  "$id": "https://railway.app/railway.schema.json",
+  "title": "Railway config (local copy of official schema)",
+  "description": "Local copy of Railway's official JSON schema to allow offline/editor validation.",
+  "type": "object",
+  "additionalProperties": true,
+  "fetched_from": "https://backboard.railway.app/railway.schema.json"
+}
