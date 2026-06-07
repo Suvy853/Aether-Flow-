@@ -3,7 +3,7 @@ import sys
 import json
 import base64
 from pathlib import Path
-from typing import Literal, cast
+from typing import Optional, cast
 from anthropic import Anthropic
 from anthropic.types.base64_image_source_param import Base64ImageSourceParam
 from anthropic.types.image_block_param import ImageBlockParam
@@ -11,6 +11,12 @@ from anthropic.types.text_block_param import TextBlockParam
 from anthropic.types.text_block import TextBlock
 from anthropic.types.thinking_block import ThinkingBlock
 from dotenv import load_dotenv
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from src.execution.telemetry import log_guardian_audit
 
 load_dotenv()
 
@@ -51,9 +57,8 @@ Respond ONLY with valid JSON:
 def load_image_as_base64(filepath: str) -> tuple[str, str]:
     """Load an image file and return base64 encoded string with media type."""
     path = Path(filepath)
-    
+
     ext = path.suffix.lower()
-    media_type_map: dict[str, Literal["image/png", "image/jpeg", "image/gif", "image/webp"]]
     media_type_map = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -61,29 +66,28 @@ def load_image_as_base64(filepath: str) -> tuple[str, str]:
         ".gif": "image/gif",
         ".webp": "image/webp"
     }
-    media_type = media_type_map.get(ext)
-    if media_type is None:
-        media_type = "image/png"
-    
+    media_type = media_type_map.get(ext, "image/png")
+
     with open(filepath, "rb") as f:
         image_data = base64.standard_b64encode(f.read()).decode("utf-8")
-    
+
     return image_data, media_type
 
 
 def audit_chart(
     filepath: str,
     step_context: str,
-    pipeline_goal: str
+    pipeline_goal: str,
+    run_uuid: Optional[str] = None
 ) -> dict:
     """
     Send a chart to Claude Vision for quality audit.
-    Returns structured audit result.
+    Logs result to telemetry if run_uuid provided.
     """
     print(f"\n👁️  Guardian auditing: {filepath}")
-    
+
     if not os.path.exists(filepath):
-        return {
+        audit = {
             "verdict": "FAIL",
             "confidence": 1.0,
             "findings": {},
@@ -91,9 +95,20 @@ def audit_chart(
             "recommendation": "Pipeline output is missing — do not deploy.",
             "metrics_extracted": {}
         }
-    
+        if run_uuid:
+            log_guardian_audit(
+                run_uuid=run_uuid,
+                chart_filepath=filepath,
+                verdict="FAIL",
+                confidence=1.0,
+                findings={},
+                issues=[f"File not found: {filepath}"],
+                deploy_approved=False
+            )
+        return audit
+
     image_data, media_type = load_image_as_base64(filepath)
-    
+
     prompt = f"""Audit this pipeline output chart.
 
 Pipeline goal: {pipeline_goal}
@@ -102,19 +117,18 @@ File: {filepath}
 
 Inspect the chart carefully and provide your audit verdict."""
 
-    media_type_literal = cast(Literal["image/png", "image/jpeg", "image/gif", "image/webp"], media_type)
-    image_source: Base64ImageSourceParam = {
+    image_source = cast(Base64ImageSourceParam, {
         "type": "base64",
-        "media_type": media_type_literal,
+        "media_type": media_type,
         "data": image_data,
-    }
+    })
     image_block: ImageBlockParam = {
         "type": "image",
         "source": image_source,
     }
     text_block: TextBlockParam = {
         "type": "text",
-        "text": prompt
+        "text": prompt,
     }
 
     response = client.messages.create(
@@ -149,10 +163,24 @@ Inspect the chart carefully and provide your audit verdict."""
         icon = "✅" if verdict == "PASS" else "❌"
         print(f"     {icon} Verdict: {verdict} (confidence: {confidence:.0%})")
         print(f"     → {audit.get('recommendation', '')}")
+
+        # Log to telemetry
+        if run_uuid:
+            log_guardian_audit(
+                run_uuid=run_uuid,
+                chart_filepath=filepath,
+                verdict=verdict,
+                confidence=confidence,
+                findings=audit.get("findings", {}),
+                issues=audit.get("issues", []),
+                deploy_approved=(verdict == "PASS")
+            )
+
         return audit
+
     except json.JSONDecodeError as e:
         print(f"     ✗ Failed to parse audit: {e}")
-        return {
+        audit = {
             "verdict": "FAIL",
             "confidence": 0.5,
             "findings": {},
@@ -161,47 +189,60 @@ Inspect the chart carefully and provide your audit verdict."""
             "metrics_extracted": {},
             "raw": raw
         }
+        if run_uuid:
+            log_guardian_audit(
+                run_uuid=run_uuid,
+                chart_filepath=filepath,
+                verdict="FAIL",
+                confidence=0.5,
+                findings={},
+                issues=[f"Audit parsing failed: {str(e)}"],
+                deploy_approved=False
+            )
+        return audit
 
 
 def audit_pipeline_outputs(
     results: dict,
     plan: dict,
-    pipeline_goal: str
+    pipeline_goal: str,
+    run_uuid: Optional[str] = None
 ) -> dict:
     """
     Scan all pipeline results for chart outputs and audit each one.
     Returns a guardian report with overall deployment decision.
     """
     print(f"\n🛡️  Multimodal Guardian — auditing pipeline outputs...")
-    
+
     audits = {}
     chart_extensions = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-    
-    # Find all chart outputs across results
+    seen_files = set()
+
+    # Find chart outputs from step results
     for step_id, result in results.items():
         if result.get("status") != "success":
             continue
-        
-        # Check for file paths in result
+
         for key, value in result.items():
             if isinstance(value, str) and any(value.endswith(ext) for ext in chart_extensions):
-                if os.path.exists(value):
-                    # Find step context
+                if os.path.exists(value) and value not in seen_files:
+                    seen_files.add(value)
                     step_context = next(
                         (s["task"] for s in plan["steps"] if s["id"] == step_id),
                         step_id
                     )
-                    audit = audit_chart(value, step_context, pipeline_goal)
+                    audit = audit_chart(value, step_context, pipeline_goal, run_uuid)
                     audits[value] = audit
 
-    # Also scan outputs directory for any charts
+    # Scan outputs directory for any missed charts
     outputs_dir = Path("outputs")
     if outputs_dir.exists():
         for chart_file in outputs_dir.glob("*"):
             if chart_file.suffix.lower() in chart_extensions:
                 filepath = str(chart_file)
-                if filepath not in audits:
-                    audit = audit_chart(filepath, "Pipeline output", pipeline_goal)
+                if filepath not in seen_files:
+                    seen_files.add(filepath)
+                    audit = audit_chart(filepath, "Pipeline output", pipeline_goal, run_uuid)
                     audits[filepath] = audit
 
     # Overall deployment decision
@@ -222,7 +263,8 @@ def audit_pipeline_outputs(
         "audits": audits,
         "total_charts": len(audits),
         "passed": sum(1 for a in audits.values() if a.get("verdict") == "PASS"),
-        "pipeline_goal": pipeline_goal
+        "pipeline_goal": pipeline_goal,
+        "run_uuid": run_uuid
     }
 
     icon = "✅" if deploy else "❌"
@@ -240,29 +282,27 @@ def print_guardian_report(report: dict):
     print(f"Deploy approved: {report['deploy_approved']}")
     print(f"Charts audited: {report['total_charts']}")
     print(f"Passed: {report['passed']}/{report['total_charts']}")
-    
+    if report.get("run_uuid"):
+        print(f"Run ID: {report['run_uuid'][:8]}")
+
     for filepath, audit in report["audits"].items():
         print(f"\n  Chart: {filepath}")
         print(f"  Verdict: {audit.get('verdict')} ({audit.get('confidence', 0):.0%} confidence)")
-        
+
         findings = audit.get("findings", {})
         for category, observation in findings.items():
             print(f"  {category}: {observation}")
-        
+
         issues = audit.get("issues", [])
         if issues:
             print(f"  Issues: {', '.join(issues)}")
-        
+
         metrics = audit.get("metrics_extracted", {})
         if metrics:
             print(f"  Extracted metrics: {json.dumps(metrics, indent=4)}")
 
 
 if __name__ == "__main__":
-    root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    if root_dir not in sys.path:
-        sys.path.insert(0, root_dir)
-
     from src.discovery.mcp_server import discover_all_sources
     from src.planner.agent import plan_pipeline, print_plan
     from src.execution.executor import execute_pipeline
@@ -273,7 +313,15 @@ if __name__ == "__main__":
     plan = plan_pipeline(goal, context["summary"])
     print_plan(plan)
 
-    results = execute_pipeline(plan, context["summary"])
+    results, run_uuid = execute_pipeline(plan, context["summary"])
 
-    report = audit_pipeline_outputs(results, plan, goal)
+    report = audit_pipeline_outputs(results, plan, goal, run_uuid)
     print_guardian_report(report)
+
+    # Verify telemetry
+    from src.execution.telemetry import get_pipeline_stats
+    stats = get_pipeline_stats()
+    print(f"\nMLOps Telemetry:")
+    print(f"  Total runs: {stats['overall']['total_runs']}")
+    print(f"  Total repairs: {stats['overall']['total_repairs']}")
+    print(f"  Approved runs: {stats['overall']['approved_runs']}")
