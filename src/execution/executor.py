@@ -5,16 +5,8 @@ import time
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import cast
 from anthropic import Anthropic
-from anthropic.types.text_block import TextBlock
-from anthropic.types.thinking_block import ThinkingBlock
 from dotenv import load_dotenv
-
-ROOT_DIR = Path(__file__).resolve().parents[2]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
 from src.execution.telemetry import (
     generate_run_uuid,
     log_pipeline_run,
@@ -31,6 +23,7 @@ CODE_GEN_SYSTEM_PROMPT = """You are Aether-Flow's Code Generator. You generate c
 Rules:
 - Generate ONLY the Python code, no explanations, no markdown fences
 - The code must be self-contained and executable as a script
+- ALWAYS add 'import matplotlib; matplotlib.use("Agg")' as the very first matplotlib-related line before any other matplotlib or pyplot imports
 - Always print a JSON result at the end using: print("AETHER_RESULT:" + json.dumps(result))
 - The result dict must contain a 'status' key ('success' or 'error') and a 'summary' key
 - For data results, include a 'data' key with a sample (max 10 rows as list of dicts)
@@ -38,6 +31,7 @@ Rules:
 - Use environment variables for credentials via os.getenv()
 - Handle exceptions with try/except and still print AETHER_RESULT on failure
 - For file outputs (charts), include the filepath in result
+- Always create the outputs directory with os.makedirs('outputs', exist_ok=True) before saving any file
 - Keep code focused on exactly what the step requires"""
 
 REPAIR_SYSTEM_PROMPT = """You are Aether-Flow's Code Repair Agent. You fix broken Python code.
@@ -50,9 +44,10 @@ You will receive:
 Rules:
 - Return ONLY the fixed Python code, no explanations, no markdown fences
 - Fix the root cause, not just the symptom
-- Keep the same structure and logic, just fix what's broken
+- Keep the same structure and logic, just fix what is broken
+- ALWAYS include 'import matplotlib; matplotlib.use("Agg")' before any matplotlib imports
 - Always end with print("AETHER_RESULT:" + json.dumps(result))
-- Be precise — don't rewrite what works"""
+- Be precise, do not rewrite what works"""
 
 
 def generate_code(step: dict, context_summary: str, previous_results: dict) -> str:
@@ -94,21 +89,14 @@ Generate the complete executable Python script now."""
         messages=[{"role": "user", "content": prompt}]
     )
 
-    first_block = response.content[0]
-    if first_block.type == "text":
-        code = cast(TextBlock, first_block).text.strip()
-    elif first_block.type == "thinking":
-        code = cast(ThinkingBlock, first_block).thinking.strip()
-    else:
-        code = ""
-
+    code = response.content[0].text.strip() # pyright: ignore[reportAttributeAccessIssue]
     if code.startswith("```"):
         lines = code.split("\n")
         code = "\n".join(lines[1:-1])
     return code
 
 
-def execute_code(code: str, step_id: str, timeout: int = 60) -> dict:
+def execute_code(code: str, step_id: str, timeout: int = 120) -> dict:
     """Execute generated code in a subprocess sandbox."""
     env = os.environ.copy()
 
@@ -187,14 +175,7 @@ Return only the fixed Python code."""
         messages=[{"role": "user", "content": prompt}]
     )
 
-    first_block = response.content[0]
-    if first_block.type == "text":
-        fixed = cast(TextBlock, first_block).text.strip()
-    elif first_block.type == "thinking":
-        fixed = cast(ThinkingBlock, first_block).thinking.strip()
-    else:
-        fixed = ""
-
+    fixed = response.content[0].text.strip() # pyright: ignore[reportAttributeAccessIssue]
     if fixed.startswith("```"):
         lines = fixed.split("\n")
         fixed = "\n".join(lines[1:-1])
@@ -209,7 +190,7 @@ def execute_step_with_healing(
     max_retries: int = 3
 ) -> dict:
     """Execute a single pipeline step with automatic self-healing and telemetry."""
-    print(f"\n  ⚙️  Executing [{step['id']}]: {step['task']}")
+    print(f"\n  Executing [{step['id']}]: {step['task']}")
 
     step_start = time.time()
     repairs_triggered = 0
@@ -218,13 +199,13 @@ def execute_step_with_healing(
 
     code = generate_code(step, context_summary, previous_results)
     lines_of_code = len(code.split("\n"))
-    print(f"     → Code generated ({lines_of_code} lines)")
+    print(f"     -> Code generated ({lines_of_code} lines)")
 
     for attempt in range(1, max_retries + 1):
         result = execute_code(code, step['id'])
 
         if result.get("status") == "success":
-            print(f"     ✓ Success on attempt {attempt}: {result.get('summary', '')}")
+            print(f"     Success on attempt {attempt}: {result.get('summary', '')}")
 
             execution_time = time.time() - step_start
             log_step_execution(
@@ -242,15 +223,14 @@ def execute_step_with_healing(
             return result
 
         error = result.get("error", "Unknown error")
-        print(f"     ✗ Attempt {attempt} failed: {error[:100]}...")
+        print(f"     Attempt {attempt} failed: {error[:100]}...")
         final_error_message = error
         final_error_type = error.split("\n")[-1][:100] if error else "Unknown"
 
         if attempt < max_retries:
             lines_before = len(code.split("\n"))
-            print(f"     🔧 Reflexion loop: repairing code...")
+            print(f"     Reflexion loop: repairing code...")
 
-            # Log repair event
             log_repair_event(
                 run_uuid=run_uuid,
                 step_id=step['id'],
@@ -265,12 +245,11 @@ def execute_step_with_healing(
             code = repair_code(code, error, step)
             lines_after = len(code.split("\n"))
             repairs_triggered += 1
-            print(f"     → Repaired code generated ({lines_after} lines)")
+            print(f"     Repaired code generated ({lines_after} lines)")
 
         else:
-            print(f"     ✗ All {max_retries} attempts failed for [{step['id']}]")
+            print(f"     All {max_retries} attempts failed for [{step['id']}]")
 
-            # Log final failed repair
             log_repair_event(
                 run_uuid=run_uuid,
                 step_id=step['id'],
@@ -305,15 +284,12 @@ def execute_step_with_healing(
 
 
 def execute_pipeline(plan: dict, context_summary: str) -> tuple[dict, str]:
-    """
-    Execute all steps in the pipeline DAG with telemetry.
-    Returns (results dict, run_uuid).
-    """
+    """Execute all steps in the pipeline DAG with telemetry."""
     run_uuid = generate_run_uuid()
     pipeline_start = time.time()
     total_repairs = 0
 
-    print(f"\n🚀 Starting pipeline execution: {len(plan['steps'])} steps")
+    print(f"\n Starting pipeline execution: {len(plan['steps'])} steps")
     print(f"   Run ID: {run_uuid[:8]}...")
     print(f"   Complexity: {plan['estimated_complexity']}")
 
@@ -331,7 +307,7 @@ def execute_pipeline(plan: dict, context_summary: str) -> tuple[dict, str]:
                 dep for dep in step.get("depends_on", [])
                 if results.get(dep, {}).get("status") != "success"
             ]
-            print(f"\n  ⏭️  Skipping [{step['id']}]: dependencies failed: {failed_deps}")
+            print(f"\n  Skipping [{step['id']}]: dependencies failed: {failed_deps}")
             results[step['id']] = {
                 "status": "skipped",
                 "reason": f"Dependencies failed: {failed_deps}",
@@ -348,7 +324,6 @@ def execute_pipeline(plan: dict, context_summary: str) -> tuple[dict, str]:
         if result.get("status") != "success":
             failed_steps.append(step['id'])
 
-    # Tally repairs
     for step in plan['steps']:
         step_result = results.get(step['id'], {})
         total_repairs += step_result.get("repairs_triggered", 0)
@@ -356,7 +331,6 @@ def execute_pipeline(plan: dict, context_summary: str) -> tuple[dict, str]:
     succeeded = sum(1 for r in results.values() if r.get("status") == "success")
     execution_time = time.time() - pipeline_start
 
-    # Log pipeline run
     log_pipeline_run(
         run_uuid=run_uuid,
         goal=plan['goal'],
@@ -397,7 +371,6 @@ if __name__ == "__main__":
         summary = result.get("summary", "")
         print(f"  [{step_id}] {status}: {summary}")
 
-    # Show telemetry stats
     from src.execution.telemetry import get_pipeline_stats
     stats = get_pipeline_stats()
     print(f"\nMLOps Telemetry:")
