@@ -1,14 +1,26 @@
 import os
 import sys
 import json
+import time
 import subprocess
 import tempfile
-import textwrap
+from pathlib import Path
 from typing import cast
 from anthropic import Anthropic
 from anthropic.types.text_block import TextBlock
 from anthropic.types.thinking_block import ThinkingBlock
 from dotenv import load_dotenv
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from src.execution.telemetry import (
+    generate_run_uuid,
+    log_pipeline_run,
+    log_step_execution,
+    log_repair_event
+)
 
 load_dotenv()
 
@@ -45,7 +57,7 @@ Rules:
 
 def generate_code(step: dict, context_summary: str, previous_results: dict) -> str:
     """Ask Claude to generate Python code for a pipeline step."""
-    
+
     prev_context = ""
     if previous_results:
         prev_context = "\nPrevious step results available:\n"
@@ -97,15 +109,12 @@ Generate the complete executable Python script now."""
 
 
 def execute_code(code: str, step_id: str, timeout: int = 60) -> dict:
-    """
-    Execute generated code in a subprocess sandbox.
-    Returns parsed result dict.
-    """
+    """Execute generated code in a subprocess sandbox."""
     env = os.environ.copy()
-    
+
     with tempfile.NamedTemporaryFile(
-        mode='w', 
-        suffix='.py', 
+        mode='w',
+        suffix='.py',
         delete=False,
         prefix=f'aether_{step_id}_'
     ) as f:
@@ -124,7 +133,6 @@ def execute_code(code: str, step_id: str, timeout: int = 60) -> dict:
         stdout = result.stdout
         stderr = result.stderr
 
-        # Extract AETHER_RESULT from stdout
         for line in stdout.split("\n"):
             if line.startswith("AETHER_RESULT:"):
                 try:
@@ -132,7 +140,6 @@ def execute_code(code: str, step_id: str, timeout: int = 60) -> dict:
                 except json.JSONDecodeError:
                     pass
 
-        # If no result marker found, it's a failure
         return {
             "status": "error",
             "error": stderr or "No AETHER_RESULT found in output",
@@ -148,7 +155,7 @@ def execute_code(code: str, step_id: str, timeout: int = 60) -> dict:
         }
     except Exception as e:
         return {
-            "status": "error", 
+            "status": "error",
             "error": str(e),
             "summary": f"Execution failed: {e}"
         }
@@ -158,7 +165,7 @@ def execute_code(code: str, step_id: str, timeout: int = 60) -> dict:
 
 def repair_code(code: str, error: str, step: dict) -> str:
     """Ask Claude to repair broken code using the error traceback."""
-    
+
     prompt = f"""Fix this broken Python code:
 
 STEP CONTEXT:
@@ -198,52 +205,122 @@ def execute_step_with_healing(
     step: dict,
     context_summary: str,
     previous_results: dict,
+    run_uuid: str,
     max_retries: int = 3
 ) -> dict:
-    """
-    Execute a single pipeline step with automatic self-healing.
-    Retries up to max_retries times on failure.
-    """
+    """Execute a single pipeline step with automatic self-healing and telemetry."""
     print(f"\n  ⚙️  Executing [{step['id']}]: {step['task']}")
 
+    step_start = time.time()
+    repairs_triggered = 0
+    final_error_type = None
+    final_error_message = None
+
     code = generate_code(step, context_summary, previous_results)
-    print(f"     → Code generated ({len(code.split(chr(10)))} lines)")
+    lines_of_code = len(code.split("\n"))
+    print(f"     → Code generated ({lines_of_code} lines)")
 
     for attempt in range(1, max_retries + 1):
         result = execute_code(code, step['id'])
 
         if result.get("status") == "success":
             print(f"     ✓ Success on attempt {attempt}: {result.get('summary', '')}")
+
+            execution_time = time.time() - step_start
+            log_step_execution(
+                run_uuid=run_uuid,
+                step_id=step['id'],
+                task=step['task'],
+                source=step['source'],
+                operation=step['operation'],
+                status="success",
+                attempts=attempt,
+                repairs_triggered=repairs_triggered,
+                execution_time_seconds=execution_time,
+                lines_of_code=lines_of_code
+            )
             return result
 
         error = result.get("error", "Unknown error")
         print(f"     ✗ Attempt {attempt} failed: {error[:100]}...")
+        final_error_message = error
+        final_error_type = error.split("\n")[-1][:100] if error else "Unknown"
 
         if attempt < max_retries:
+            lines_before = len(code.split("\n"))
             print(f"     🔧 Reflexion loop: repairing code...")
+
+            # Log repair event
+            log_repair_event(
+                run_uuid=run_uuid,
+                step_id=step['id'],
+                attempt_number=attempt,
+                error_type=final_error_type,
+                error_message=error,
+                repair_successful=False,
+                lines_before=lines_before,
+                lines_after=0
+            )
+
             code = repair_code(code, error, step)
-            print(f"     → Repaired code generated ({len(code.split(chr(10)))} lines)")
+            lines_after = len(code.split("\n"))
+            repairs_triggered += 1
+            print(f"     → Repaired code generated ({lines_after} lines)")
+
         else:
             print(f"     ✗ All {max_retries} attempts failed for [{step['id']}]")
+
+            # Log final failed repair
+            log_repair_event(
+                run_uuid=run_uuid,
+                step_id=step['id'],
+                attempt_number=attempt,
+                error_type=final_error_type,
+                error_message=error,
+                repair_successful=False,
+                lines_before=lines_of_code,
+                lines_after=0
+            )
+
+            execution_time = time.time() - step_start
+            log_step_execution(
+                run_uuid=run_uuid,
+                step_id=step['id'],
+                task=step['task'],
+                source=step['source'],
+                operation=step['operation'],
+                status="failed",
+                attempts=attempt,
+                repairs_triggered=repairs_triggered,
+                execution_time_seconds=execution_time,
+                error_type=final_error_type,
+                error_message=final_error_message,
+                lines_of_code=lines_of_code
+            )
+
             result["step_id"] = step['id']
             return result
 
     return result
 
 
-def execute_pipeline(plan: dict, context_summary: str) -> dict:
+def execute_pipeline(plan: dict, context_summary: str) -> tuple[dict, str]:
     """
-    Execute all steps in the pipeline DAG in dependency order.
-    Returns all results keyed by step_id.
+    Execute all steps in the pipeline DAG with telemetry.
+    Returns (results dict, run_uuid).
     """
+    run_uuid = generate_run_uuid()
+    pipeline_start = time.time()
+    total_repairs = 0
+
     print(f"\n🚀 Starting pipeline execution: {len(plan['steps'])} steps")
+    print(f"   Run ID: {run_uuid[:8]}...")
     print(f"   Complexity: {plan['estimated_complexity']}")
 
     results = {}
     failed_steps = []
 
     for step in plan['steps']:
-        # Check dependencies
         deps_ok = all(
             results.get(dep, {}).get("status") == "success"
             for dep in step.get("depends_on", [])
@@ -263,45 +340,67 @@ def execute_pipeline(plan: dict, context_summary: str) -> dict:
             failed_steps.append(step['id'])
             continue
 
-        result = execute_step_with_healing(step, context_summary, results)
+        result = execute_step_with_healing(
+            step, context_summary, results, run_uuid
+        )
         results[step['id']] = result
 
         if result.get("status") != "success":
             failed_steps.append(step['id'])
 
-    # Pipeline summary
+    # Tally repairs
+    for step in plan['steps']:
+        step_result = results.get(step['id'], {})
+        total_repairs += step_result.get("repairs_triggered", 0)
+
     succeeded = sum(1 for r in results.values() if r.get("status") == "success")
+    execution_time = time.time() - pipeline_start
+
+    # Log pipeline run
+    log_pipeline_run(
+        run_uuid=run_uuid,
+        goal=plan['goal'],
+        complexity=plan['estimated_complexity'],
+        total_steps=len(plan['steps']),
+        steps_succeeded=succeeded,
+        steps_failed=len(failed_steps),
+        deploy_approved=len(failed_steps) == 0,
+        total_repairs=total_repairs,
+        execution_time_seconds=execution_time
+    )
+
     print(f"\n{'='*50}")
     print(f"PIPELINE COMPLETE: {succeeded}/{len(plan['steps'])} steps succeeded")
+    print(f"Run ID: {run_uuid[:8]} | Time: {execution_time:.1f}s | Repairs: {total_repairs}")
     if failed_steps:
         print(f"Failed steps: {failed_steps}")
     print(f"{'='*50}")
 
-    return results
+    return results, run_uuid
 
 
 if __name__ == "__main__":
-    root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    if root_dir not in sys.path:
-        sys.path.insert(0, root_dir)
-
     from src.discovery.mcp_server import discover_all_sources
     from src.planner.agent import plan_pipeline, print_plan
 
-    # Run discovery
     context = discover_all_sources(csv_path="examples/retail.csv")
 
-    # Plan the pipeline
     goal = "Fetch the top 5 transaction categories by total amount from PostgreSQL and show the results"
     plan = plan_pipeline(goal, context["summary"])
     print_plan(plan)
 
-    # Execute with self-healing
-    results = execute_pipeline(plan, context["summary"])
+    results, run_uuid = execute_pipeline(plan, context["summary"])
 
-    # Show results
     print("\nFINAL RESULTS:")
     for step_id, result in results.items():
         status = result.get("status", "unknown")
         summary = result.get("summary", "")
         print(f"  [{step_id}] {status}: {summary}")
+
+    # Show telemetry stats
+    from src.execution.telemetry import get_pipeline_stats
+    stats = get_pipeline_stats()
+    print(f"\nMLOps Telemetry:")
+    print(f"  Total pipeline runs: {stats['overall']['total_runs']}")
+    print(f"  Total repairs logged: {stats['overall']['total_repairs']}")
+    print(f"  Avg execution time: {stats['overall']['avg_execution_time']}s")
