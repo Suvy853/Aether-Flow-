@@ -1,7 +1,7 @@
 import os
 import json
-import asyncio
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.wsgi import WSGIMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -24,7 +24,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory job store (keyed by run_uuid)
+from flask import Flask
+from src.ui.dashboard import create_dash_app
+
+flask_server = Flask(__name__)
+dash_app = create_dash_app(server=flask_server, url_base_pathname="/dashboard/")
+app.mount("/dashboard", WSGIMiddleware(flask_server))
+app.mount("/_dash-component-suites", WSGIMiddleware(flask_server))
+app.mount("/_dash-layout", WSGIMiddleware(flask_server))
+app.mount("/_dash-dependencies", WSGIMiddleware(flask_server))
+app.mount("/_dash-update-component", WSGIMiddleware(flask_server))
+app.mount("/_reload-hash", WSGIMiddleware(flask_server))
+
 jobs = {}
 
 
@@ -33,15 +44,33 @@ class PipelineRequest(BaseModel):
     csv_path: Optional[str] = "examples/retail.csv"
 
 
-class PipelineResponse(BaseModel):
-    run_uuid: str
-    status: str
-    message: str
-    started_at: str
+@app.get("/")
+def root():
+    return {
+        "name": "Aether-Flow",
+        "version": "1.0.0",
+        "description": "Self-Healing MLOps Pipeline Orchestrator",
+        "dashboard": "/dashboard/",
+        "endpoints": {
+            "POST /pipeline/run": "Start a new pipeline",
+            "GET /pipeline/{job_id}/status": "Check pipeline status",
+            "GET /pipeline/{job_id}/result": "Get pipeline result",
+            "GET /telemetry/stats": "MLOps telemetry stats",
+            "GET /telemetry/runs": "Recent pipeline runs",
+            "GET /health": "Health check"
+        }
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    }
 
 
 def run_pipeline_task(goal: str, csv_path: str, run_uuid_placeholder: str):
-    """Background task that runs the full pipeline."""
     try:
         jobs[run_uuid_placeholder]["status"] = "running"
         jobs[run_uuid_placeholder]["phase"] = "discovery"
@@ -91,34 +120,8 @@ def run_pipeline_task(goal: str, csv_path: str, run_uuid_placeholder: str):
         jobs[run_uuid_placeholder]["error"] = str(e)
 
 
-@app.get("/")
-def root():
-    return {
-        "name": "Aether-Flow",
-        "version": "1.0.0",
-        "description": "Self-Healing MLOps Pipeline Orchestrator",
-        "endpoints": {
-            "POST /pipeline/run": "Start a new pipeline",
-            "GET /pipeline/{job_id}/status": "Check pipeline status",
-            "GET /pipeline/{job_id}/result": "Get pipeline result",
-            "GET /telemetry/stats": "MLOps telemetry stats",
-            "GET /telemetry/runs": "Recent pipeline runs",
-            "GET /health": "Health check"
-        }
-    }
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
-    }
-
-
 @app.post("/pipeline/run")
 def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTasks):
-    """Start a new pipeline run asynchronously."""
     if not request.goal.strip():
         raise HTTPException(status_code=400, detail="Goal cannot be empty")
 
@@ -135,12 +138,10 @@ def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTasks):
         "error": None
     }
 
-    csv_path = request.csv_path or "examples/retail.csv"
-
     background_tasks.add_task(
         run_pipeline_task,
         request.goal,
-        csv_path,
+        request.csv_path, # pyright: ignore[reportArgumentType]
         job_id
     )
 
@@ -154,10 +155,8 @@ def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTasks):
 
 @app.get("/pipeline/{job_id}/status")
 def get_status(job_id: str):
-    """Poll pipeline execution status."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-
     job = jobs[job_id]
     return {
         "job_id": job_id,
@@ -172,20 +171,16 @@ def get_status(job_id: str):
 
 @app.get("/pipeline/{job_id}/result")
 def get_result(job_id: str):
-    """Get the full result of a completed pipeline run."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-
     job = jobs[job_id]
-
     if job["status"] != "complete":
         return {
             "job_id": job_id,
             "status": job["status"],
             "phase": job["phase"],
-            "message": "Pipeline not yet complete. Check /status first."
+            "message": "Pipeline not yet complete."
         }
-
     return {
         "job_id": job_id,
         "status": "complete",
@@ -196,7 +191,6 @@ def get_result(job_id: str):
 
 @app.get("/telemetry/stats")
 def telemetry_stats():
-    """Get aggregated MLOps telemetry statistics."""
     from src.execution.telemetry import get_pipeline_stats
     stats = get_pipeline_stats()
     if "error" in stats:
@@ -206,7 +200,6 @@ def telemetry_stats():
 
 @app.get("/telemetry/runs")
 def recent_runs():
-    """Get recent pipeline runs from telemetry."""
     from src.execution.telemetry import get_pipeline_stats
     stats = get_pipeline_stats()
     return {
@@ -217,7 +210,6 @@ def recent_runs():
 
 @app.get("/jobs")
 def list_jobs():
-    """List all jobs in the current session."""
     return {
         "total": len(jobs),
         "jobs": [
