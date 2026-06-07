@@ -4,13 +4,7 @@ import sys
 mode = os.getenv("START_MODE", "api")
 
 if mode == "dashboard":
-    # Import dynamically to avoid static import issues if `main` isn't exported
-    import importlib
-
-    mod = importlib.import_module("src.ui.dashboard_prod")
-    main = getattr(mod, "main", None)
-    if not callable(main):
-        raise ImportError("module 'src.ui.dashboard_prod' has no callable 'main'")
+    from src.ui.dashboard_prod import main
     main()
 else:
     import uvicorn
